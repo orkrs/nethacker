@@ -1,0 +1,8 @@
+{
+  "schema": "nethackers.solution/v1",
+  "name": "valkyrie_pro",
+  "root": "valkyrie_pro",
+  "parents": [],
+  "influences": [],
+  "entrypoint": "bot.py"
+}
