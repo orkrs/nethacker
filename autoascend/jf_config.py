@@ -12,19 +12,19 @@ import os
 # EARLY: prayer at pray.c's critically_low_hp instead of 'HP < 12', eat carried food before a
 #   hunger prayer below XL 5 -- these reshuffle games from the first prayer on.
 EARLY_FIXES = False
-LATE_FIXES = True
+LATE_FIXES = False
 # the rarest-hazard subset of LATE_FIXES (gas spore next to the pet, cockatrice-family corpse
 # squares, spotted/ochre jelly and gelatinous cube melee): these first fire close to the deaths
 # they prevent, so they barely perturb the elite's public trajectories
-HAZARD_FIXES = True
+HAZARD_FIXES = False
 # master switch kept for older experiment configs: sets both
 TOUR_FIXES = None
 # Excalibur dips only at >= 90% HP with a prayer ready (astra); changes the tour
-SAFE_DIPS = True
+SAFE_DIPS = False
 # when Weak or worse with HP > 40, poisonous/acidic corpses are acceptable food
 STARVING_EATS = True
 # astra's survival layer (Elbereth rest, retreat upstairs) also during the levelling tour
-SURVIVAL_IN_TOUR = True
+SURVIVAL_IN_TOUR = False
 # at critically low HP with no safe prayer and a hostile adjacent: stairs, unknown wands/potions/scrolls
 LAST_RESORT = True
 

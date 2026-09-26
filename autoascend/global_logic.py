@@ -542,8 +542,6 @@ class GlobalLogic:
     def _safe_to_dip(self):
         # SAFE_DIPS (full HP + prayer ready, astra) changes the tour; off until tested on its own
         bl = self.agent.blstats
-        if bl.depth <= 1:
-            return False
         if not jf_config.SAFE_DIPS:
             return bl.experience_level >= 7
         return bl.experience_level >= 7 and bl.hitpoints >= 0.9 * bl.max_hitpoints and \

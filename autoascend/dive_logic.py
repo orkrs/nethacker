@@ -847,27 +847,9 @@ class DiveLogic:
         self.tool_spots.discard((key, spot))
 
     def first_level_done(self):
-        """The tour's Dlvl 1 grind ends at XL 8 (DT6A), or earlier for a tool run,
-        or gentle fallback if the floor is thoroughly cleared or food is exhausted."""
+        """The tour's Dlvl 1 grind ends at XL 8 (DT6A), or earlier for a tool run."""
         xl = self.agent.blstats.experience_level
-        if xl >= 8:
-            return True
-        if TOOL_RUN_XL is not None and xl >= TOOL_RUN_XL:
-            return True
-
-        # Gentle, safe descent valves:
-        # 1. Level cleared & well-levelled:
-        #    If >= 1500 turns on Dlvl 1 and XL >= 5 (Valkyrie has ~45 HP, very safe for Dlvl 2)
-        #    Or if >= 2500 turns on Dlvl 1 (FULL_EXPLORE_TURNS) and XL >= 4
-        if (self.turns_on_level() >= 1500 and xl >= 5) or (self.turns_on_level() >= 2500 and xl >= 4):
-            return True
-
-        # 2. Critical starvation defense: if WEAK/FAINTING and 0 carried food
-        #    Descending to Dlvl 2 is the ONLY chance to find food/corpses before dying of starvation!
-        if self.agent.blstats.hunger_state >= Hunger.WEAK and self.agent.inventory.items.total_nutrition() == 0:
-            return True
-
-        return False
+        return xl >= 8 or (TOOL_RUN_XL is not None and xl >= TOOL_RUN_XL)
 
     def _min_xl(self, default):
         return default if TOOL_RUN_XL is None else min(default, TOOL_RUN_XL)
