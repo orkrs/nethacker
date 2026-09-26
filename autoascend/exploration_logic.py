@@ -1,3 +1,4 @@
+import difflib
 import re
 
 import cv2
@@ -227,10 +228,14 @@ class ExplorationLogic:
             yield True
             with self.agent.atom_operation():
                 self.agent.step(A.Command.LOOK)
-                r = re.search(r'There is an altar to [a-zA-Z- ]+ \(([a-z]+)\) here.', self.agent.message or self.agent.popup[0])
-                assert r is not None, (self.agent.message, self.agent.popup)
+                msg = self.agent.message or (self.agent.popup[0] if self.agent.popup else '')
+                r = re.search(r'There is an altar to [a-zA-Z- ]+ \(([a-z]+)\) here.', msg)
+                if r is None:
+                    self.agent.step(A.Command.ESC)
+                    return
                 alignment = r.groups()[0]
-                assert alignment in Character.name_to_alignment, (alignment, self.agent.message)
+                if alignment not in Character.name_to_alignment:
+                    return
                 alignment = Character.name_to_alignment[alignment]
                 level.altars[pos] = alignment
                 return
@@ -267,8 +272,18 @@ class ExplorationLogic:
             # TODO: polymorphed into a handless creature, too heavy load to kick, using lockpicks
 
             yielded = False
+            # hypothesis: respecting the explicit shop-closure engraving avoids
+            # kicking down the locked door and provoking a lethal shopkeeper.
+            engraving = ''.join(c for c in self.agent.inventory.engraving_below_me.lower() if c.isalpha())
+            closed_shop = difflib.SequenceMatcher(None, engraving, 'closedforinventory').ratio() >= 0.55
+            # from inside a shop the door is the shopkeeper's (a digger fell into a closed shop and kicked
+            # its locked door: the shopkeeper killed it)
+            level = self.agent.current_level()
+            y0, x0 = self.agent.blstats.y, self.agent.blstats.x
+            closed_shop = closed_shop or level.shop[y0, x0] or level.shop_interior[y0, x0]
             for py, px in self.agent.neighbors(self.agent.blstats.y, self.agent.blstats.x, diagonal=False):
-                if (self.agent.current_level().door_open_count[py, px] < door_open_count or kick_doors) and \
+                if (self.agent.current_level().door_open_count[py, px] < door_open_count or
+                        (kick_doors and not closed_shop)) and \
                         self.agent.glyphs[py, px] in G.DOOR_CLOSED:
                     if not yielded:
                         yielded = True
@@ -280,11 +295,11 @@ class ExplorationLogic:
                                     if self.agent.open_door(py, px):
                                         break
                                 else:
-                                    if kick_doors:
+                                    if kick_doors and not closed_shop:
                                         while self.agent.glyphs[py, px] in G.DOOR_CLOSED:
                                             self.agent.kick(py, px)
                             else:
-                                if kick_doors:
+                                if kick_doors and not closed_shop:
                                     while self.agent.glyphs[py, px] in G.DOOR_CLOSED:
                                         self.agent.kick(py, px)
                     break

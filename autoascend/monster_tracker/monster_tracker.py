@@ -26,10 +26,10 @@ class MonsterTracker:
             self.agent.step(A.Command.WHATIS, iter(['M']))
             if 'No monsters are currently shown on the map.' in self.agent.message:
                 return {}
-            try:
-                index = self.agent.popup.index('All monsters currently shown on the map:')
-            except IndexError:
-                assert 0, (self.agent.message, self.agent.popup)
+            if 'All monsters currently shown on the map:' not in self.agent.popup:
+                self.agent.step(A.Command.ESC)
+                return {}
+            index = self.agent.popup.index('All monsters currently shown on the map:')
             regex = re.compile(r"^<(\d+),(\d+)>  ([\x00-\x7F])  ([a-zA-z-,' ]+)$")
 
             monsters = {}

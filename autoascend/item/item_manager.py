@@ -261,7 +261,7 @@ class ItemManager:
             r'^(a|an|the|\d+)'
             r'( empty)?'
             r'( (cursed|uncursed|blessed))?'
-            r'( (very |thoroughly )?(rustproof|poisoned|corroded|rusty|burnt|rotted|partly eaten|partly used|diluted|unlocked|locked|wet|greased))*'
+            r'( (very |thoroughly )?(rustproof|poisoned|corroded|rusty|burnt|rotted|partly eaten|partly used|diluted|unlocked|locked|wet|moist|greased))*'
             r'( ([+-]\d+))? '
             r"([a-zA-z0-9-!'# ]+)"
             r'( \(([0-9]+:[0-9]+|no charge)\))?'
@@ -285,7 +285,8 @@ class ItemManager:
         ) = matches[0]
         # TODO: effects, uses
 
-        if info in {'being worn', 'being worn; slippery', 'wielded', 'chained to you'} or info.startswith(
+        if info in {'being worn', 'being worn; slippery', 'wielded', 'chained to you',
+                    'on right hand', 'on left hand'} or info.startswith(
                 'weapon in ') or \
                 info.startswith('tethered weapon in '):
             equipped = True
@@ -360,7 +361,8 @@ class ItemManager:
             if mon_name == 'spinach':
                 monster_id = None
             else:
-                monster_id = nh.glyph_to_mon(MON.from_name(mon_name))
+                _mg = MON.from_name(mon_name)
+                monster_id = nh.glyph_to_mon(_mg) if _mg is not None else None
             name = 'tin'
         elif name.endswith(' corpse') or name.endswith(' corpses'):
             mon_name = name[:name.index('corpse')].strip()
@@ -368,7 +370,8 @@ class ItemManager:
                 mon_name = mon_name[2:]
             if mon_name.startswith('an '):
                 mon_name = mon_name[3:]
-            monster_id = nh.glyph_to_mon(MON.from_name(mon_name))
+            _mg = MON.from_name(mon_name)
+            monster_id = nh.glyph_to_mon(_mg) if _mg is not None else None
             name = 'corpse'
         elif name.startswith('statue of ') or name.startswith('statues of ') or \
                 name.startswith('historic statue of ') or name.startswith('historic statues of '):
@@ -380,7 +383,8 @@ class ItemManager:
                 mon_name = mon_name[2:]
             if mon_name.startswith('an '):
                 mon_name = mon_name[3:]
-            monster_id = nh.glyph_to_mon(MON.from_name(mon_name))
+            _mg = MON.from_name(mon_name)
+            monster_id = nh.glyph_to_mon(_mg) if _mg is not None else None
             name = 'statue'
         elif name.startswith('figurine of ') or name.startswith('figurines of '):
             mon_name = name[len('figurine of '):].strip()
@@ -388,12 +392,14 @@ class ItemManager:
                 mon_name = mon_name[2:]
             if mon_name.startswith('an '):
                 mon_name = mon_name[3:]
-            monster_id = nh.glyph_to_mon(MON.from_name(mon_name))
+            _mg = MON.from_name(mon_name)
+            monster_id = nh.glyph_to_mon(_mg) if _mg is not None else None
             name = 'figurine'
         elif name in ['novel', 'paperback', 'paperback book']:
             name = 'spellbook of novel'
         elif name.endswith(' egg') or name.endswith(' eggs'):
-            monster_id = nh.glyph_to_mon(MON.from_name(name[:-len(' egg')].strip()))
+            _mg = MON.from_name(name[:-len(' egg')].strip())
+            monster_id = nh.glyph_to_mon(_mg) if _mg is not None else None
             name = 'egg'
         elif name == 'worm teeth':
             name = 'worm tooth'
@@ -472,7 +478,9 @@ class ItemManager:
             to_hit_bonus = 3  # 1d5
 
         objs, ret_glyphs = ItemManager.parse_name(name)
-        assert category is None or category == O.get_category(objs[0]), (text, category, O.get_category(objs[0]))
+        if category is not None and objs[0] != O.from_name('unknown') and category != O.get_category(objs[0]):
+            objs = [O.from_name('unknown')]
+            ret_glyphs = O.possible_glyphs_from_object(objs[0])
 
         if glyph is not None:
             assert glyph in ret_glyphs
@@ -623,18 +631,20 @@ class ItemManager:
             return [O.from_name('unknown')], O.possible_glyphs_from_object(O.from_name('unknown'))
 
         if obj_ids:
-            assert len(obj_ids) == 1, name
+            if len(obj_ids) != 1:
+                return [O.from_name('unknown')], O.possible_glyphs_from_object(O.from_name('unknown'))
             obj_id = list(obj_ids)[0]
             objs = [O.objects[obj_id]]
             glyphs = [i for i in range(nh.GLYPH_OBJ_OFF, nh.NUM_OBJECTS + nh.GLYPH_OBJ_OFF)
                       if O.objects[i - nh.GLYPH_OBJ_OFF] is not None and objs[0] in O.possibilities_from_glyph(i)]
         else:
+            if not appearance_ids:
+                return [O.from_name('unknown')], O.possible_glyphs_from_object(O.from_name('unknown'))
             glyphs = [obj_id + nh.GLYPH_OBJ_OFF for obj_id in appearance_ids]
             obj_id = list(appearance_ids)[0]
             glyph = obj_id + nh.GLYPH_OBJ_OFF
             objs = sorted(set.union(*[set(O.possibilities_from_glyph(i)) for i in glyphs]))
-            assert name == 'runed broadsword' or \
-                   all(map(lambda i: sorted(O.possibilities_from_glyph(i + nh.GLYPH_OBJ_OFF)) == objs, appearance_ids)), \
-                name
+            if name != 'runed broadsword' and not all(map(lambda i: sorted(O.possibilities_from_glyph(i + nh.GLYPH_OBJ_OFF)) == objs, appearance_ids)):
+                return [O.from_name('unknown')], O.possible_glyphs_from_object(O.from_name('unknown'))
 
         return objs, glyphs

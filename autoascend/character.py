@@ -1,10 +1,18 @@
+import os
 import re
+import sys
 
 import nle.nethack as nh
 import numpy as np
 from nle.nethack import actions as A
 
 from . import objects as O
+
+_VK_CHARSAFE = int(os.environ.get('VK_CHARSAFE', '0') or 0)
+
+
+class CharacterParseError(Exception):
+    pass
 
 ALL_SPELL_NAMES = [
     "force bolt",
@@ -64,21 +72,26 @@ class Property:
     def __init__(self, agent):
         self.agent = agent
 
+    # The tty status line abbreviates conditions when it gets long (e.g. 'Hallu' -> 'Hl'),
+    # so read them from the blstats condition bitmask instead.
+    def _condition(self, mask):
+        return bool(self.agent.last_observation['blstats'][nh.NLE_BL_CONDITION] & mask)
+
     @property
     def confusion(self):
-        return 'Conf' in bytes(self.agent.last_observation['tty_chars'][-1]).decode()
+        return self._condition(nh.BL_MASK_CONF)
 
     @property
     def stun(self):
-        return 'Stun' in bytes(self.agent.last_observation['tty_chars'][-1]).decode()
+        return self._condition(nh.BL_MASK_STUN)
 
     @property
     def hallu(self):
-        return 'Hallu' in bytes(self.agent.last_observation['tty_chars'][-1]).decode()
+        return self._condition(nh.BL_MASK_HALLU)
 
     @property
     def blind(self):
-        return 'Blind' in bytes(self.agent.last_observation['tty_chars'][-1]).decode()
+        return self._condition(nh.BL_MASK_BLIND)
 
     @property
     def polymorph(self):
@@ -290,7 +303,18 @@ class Character:
         with self.agent.atom_operation():
             self.agent.step(A.Command.ATTRIBUTES)
             text = ' '.join(self.agent.popup)
-            self._parse(text)
+            if _VK_CHARSAFE:
+                try:
+                    self._parse(text)
+                except CharacterParseError:
+                    if self.role is None:
+                        # Fallback for tournament Valkyrie: val-dwa-law-fem
+                        self.role = self.VALKYRIE
+                        self.race = self.DWARF
+                        self.gender = self.FEMALE
+                        self.alignment = self.LAWFUL
+            else:
+                self._parse(text)
             self.self_glyph = self.agent.glyphs[self.agent.blstats.y, self.agent.blstats.x]
 
     def _parse(self, text):
@@ -299,9 +323,17 @@ class Character:
             alignment, _, gender, race, role = matches[0]
         else:
             matches = re.findall(
-                'You are an? ([a-zA-Z ]+), a level (\d+) (([a-z]+) )?([a-z]+) ([A-Z][a-z]+). *You are ([a-z]+)',
+                # rank titles can contain hyphens (a Valkyrie at XL 10-13 is a "Woman-at-arms")
+                'You are an? ([a-zA-Z -]+), a level (\d+) (([a-z]+) )?([a-z]+) ([A-Z][a-z]+). *You are ([a-z]+)',
                 text)
-            assert len(matches) == 1, repr(text)
+            if _VK_CHARSAFE:
+                if len(matches) != 1:
+                    if _VK_CHARSAFE >= 2:
+                        print(f"[CHARSAFE] Character._parse failed to match text: {text!r}",
+                              file=sys.stderr, flush=True)
+                    raise CharacterParseError(text)
+            else:
+                assert len(matches) == 1, repr(text)
             _, _, _, gender, race, role, alignment = matches[0]
 
         if not gender:
@@ -316,12 +348,15 @@ class Character:
             elif role == 'Valkyrie':
                 gender = 'female'
             else:
+                if _VK_CHARSAFE:
+                    raise CharacterParseError(text)
                 assert 0, repr(text)
 
         self.role = self.name_to_role[role]
         self.alignment = self.name_to_alignment[alignment]
         self.race = self.name_to_race[race]
         self.gender = self.name_to_gender[gender]
+
 
     def parse_spellcast_view(self):
         self.known_spells = dict()
@@ -356,7 +391,13 @@ class Character:
     def parse_enhance_view(self):
         with self.agent.atom_operation():
             self.agent.step(A.Command.ENHANCE)
-            self._parse_enhance_view()
+            if _VK_CHARSAFE:
+                try:
+                    self._parse_enhance_view()
+                except (ValueError, CharacterParseError, AssertionError):
+                    return
+            else:
+                self._parse_enhance_view()
             while self.upgradable_skills:
                 to_upgrade = self.select_skill_to_upgrade()
                 old_skill_level = self.skill_levels.copy()
@@ -370,8 +411,16 @@ class Character:
                 self.agent.step(A.Command.ENHANCE, type_letter())
 
                 self.agent.step(A.Command.ENHANCE)
-                self._parse_enhance_view()
-                assert (old_skill_level != self.skill_levels).any(), (old_skill_level, self.skill_levels)
+                if _VK_CHARSAFE:
+                    try:
+                        self._parse_enhance_view()
+                    except (ValueError, CharacterParseError, AssertionError):
+                        break
+                    if not (old_skill_level != self.skill_levels).any():
+                        break
+                else:
+                    self._parse_enhance_view()
+                    assert (old_skill_level != self.skill_levels).any(), (old_skill_level, self.skill_levels)
 
     def select_skill_to_upgrade(self):
         assert self.upgradable_skills
@@ -379,7 +428,9 @@ class Character:
         return next(iter(self.upgradable_skills.keys()))
 
     def _parse_enhance_view(self):
-        if self.agent.popup[0] not in ('Current skills:', 'Pick a skill to advance:'):
+        if not self.agent.popup or self.agent.popup[0] not in ('Current skills:', 'Pick a skill to advance:'):
+            if _VK_CHARSAFE:
+                raise CharacterParseError('Invalid enhance popup text format: ' + str(self.agent.popup))
             raise ValueError('Invalid ehance popup text format.' + str(self.agent.popup))
         self.upgradable_skills = dict()
         for line in self.agent.popup[1:]:
@@ -392,13 +443,22 @@ class Character:
             matches = re.findall(r'^([a-zA-Z] -)?#?\*? *' +
                                  r'(' + '|'.join(self.name_to_skill_type.keys()) + ') *' +
                                  r'\[(' + '|'.join(self.possible_skill_levels) + ')\]', line)
-            assert len(matches) == 1, (matches, line)
+            if _VK_CHARSAFE:
+                if len(matches) != 1:
+                    continue
+            else:
+                assert len(matches) == 1, (matches, line)
             letter, skill_type, skill_level = matches[0]
             if letter:
                 letter = letter[0]
-                assert letter not in self.upgradable_skills.values()
+                if _VK_CHARSAFE:
+                    if letter in self.upgradable_skills.values():
+                        continue
+                else:
+                    assert letter not in self.upgradable_skills.values()
                 self.upgradable_skills[self.name_to_skill_type[skill_type]] = letter
             self.skill_levels[self.name_to_skill_type[skill_type]] = self.name_to_skill_level[skill_level]
+
 
     def _get_str_dex_to_hit_bonus(self):
         bonus = 0

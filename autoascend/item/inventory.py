@@ -47,6 +47,18 @@ class Inventory:
         self.engraving_below_me = None
 
         self.skip_engrave_counter = 0
+        self.empty_wands = set()  # inventory texts of wands that answered "Nothing happens"
+
+    def is_known_empty(self, item):
+        return item.text in self.empty_wands
+
+    def set_unknown_below_me(self):
+        """Stand-in when the square can't be parsed: pretend nothing useful is here."""
+        if self.items_below_me is None:
+            self.items_below_me = []
+            self.letters_below_me = []
+        if self.engraving_below_me is None:
+            self.engraving_below_me = ''
 
     def on_panic(self):
         self.items_below_me = None
@@ -209,8 +221,12 @@ class Inventory:
                 raise AgentPanic('some items from the container vanished')
             if 'You carefully open ' in self.agent.single_message or 'You open ' in self.agent.single_message:
                 yield ' '
-            assert 'You have no free hand.' not in self.agent.single_message, 'TODO: handle it'
-            assert 'Do what with ' in self.agent.single_popup[0]
+            if 'You have no free hand.' in self.agent.single_message:
+                yield 'q'
+                return
+            if not self.agent.single_popup or 'Do what with ' not in self.agent.single_popup[0]:
+                yield 'q'
+                return
             if items_to_put and items_to_take:
                 yield 'r'
             elif items_to_put and not items_to_take:
@@ -218,22 +234,28 @@ class Inventory:
             elif not items_to_put and items_to_take:
                 yield 'o'
             else:
-                assert 0
+                yield 'q'
+                return
             if items_to_put:
-                if 'Put in what type of objects?' in self.agent.single_popup[0]:
+                if self.agent.single_popup and 'Put in what type of objects?' in self.agent.single_popup[0]:
                     yield from 'a\r'
-                assert 'Put in what?' in self.agent.single_popup[0], (
-                    self.agent.single_message, self.agent.single_popup)
+                if not self.agent.single_popup or 'Put in what?' not in self.agent.single_popup[0]:
+                    yield from 'q'
+                    return
                 yield from self._select_items_in_popup(items_to_put, items_to_put_counts)
             if items_to_take:
                 while not self.agent.single_popup or self.agent.single_popup[0] not in [
                     'Take out what type of objects?', 'Take out what?']:
                     assert ' inside, you are blasted by a ' not in self.agent.message, self.agent.message
-                    assert self.agent.single_message or self.agent.single_popup, (self.agent.message, self.agent.popup)
+                    if not self.agent.single_message and not self.agent.single_popup:
+                        yield from 'q'
+                        return
                     yield ' '
                 if self.agent.single_popup[0] == 'Take out what type of objects?':
                     yield from 'a\r'
-                assert 'Take out what?' in self.agent.single_popup[0]
+                if not self.agent.single_popup or 'Take out what?' not in self.agent.single_popup[0]:
+                    yield from 'q'
+                    return
                 yield from self._select_items_in_popup(items_to_take, items_to_take_counts)
 
                 if self.agent._observation['misc'][2]:
@@ -246,17 +268,24 @@ class Inventory:
             # TODO: refactor: the same fragment is in check_container_content
             if container in self.items.all_items:
                 self.agent.step(A.Command.APPLY)
-                assert "You can't do that while carrying so much stuff." not in self.agent.message, self.agent.message
+                if "You can't do that while carrying so much stuff." in self.agent.message:
+                    return
                 self.agent.step(self.items.get_letter(container), gen())
             elif container in self.items_below_me:
                 self.agent.step(A.Command.LOOT)
                 while True:
-                    assert 'Loot which containers?' not in self.agent.popup, self.agent.popup
-                    assert 'Loot in what direction?' not in self.agent.message
+                    if 'Loot which containers?' in self.agent.popup:
+                        self.agent.step(A.Command.ESC)
+                        return
+                    if 'Loot in what direction?' in self.agent.message:
+                        self.agent.step(A.Command.ESC)
+                        return
                     if "You don't find anything here to loot." in self.agent.message:
                         raise AgentPanic('no container to loot')
                     r = re.findall(r'There is ([a-zA-z0-9# ]+) here\, loot it\? \[ynq\] \(q\)', self.agent.message)
-                    assert len(r) == 1, self.agent.message
+                    if len(r) != 1:
+                        self.agent.step(A.Command.ESC)
+                        return
                     text = r[0]
                     it = self.item_manager.get_item_from_text(text,
                                                               position=(
@@ -269,7 +298,7 @@ class Inventory:
 
                 self.agent.step('y', gen())
             else:
-                assert 0
+                return
 
         for item in chain(self.items.all_items, self.items_below_me):
             if item.is_container() and item.container_id == container.container_id:
@@ -315,11 +344,13 @@ class Inventory:
             if 'cat' in self.agent.message and ' inside the box is ' in self.agent.message:
                 raise AgentPanic('encountered a cat in a box')
 
-            assert self.agent.single_popup, (self.agent.single_message)
+            if not self.agent.single_popup:
+                return
             if '\no - ' not in '\n'.join(self.agent.single_popup):
                 # ':' sometimes doesn't display items correctly if there's >= 22 items (the first page isn't shown)
                 yield ':'
-                if ' is empty' in self.agent.single_message:
+                if ' is empty' in self.agent.single_message or any('is empty' in line for line in self.agent.single_popup):
+                    yield 'q'
                     return
                 # if self.agent.single_popup and 'Contents of ' in self.agent.single_popup[0]:
                 #     for text in self.agent.single_popup[1:]:
@@ -327,7 +358,8 @@ class Inventory:
                 #             continue
                 #         content.items.append(self.item_manager.get_item_from_text(text, position=None))
                 #     return
-                assert 0, (self.agent.single_message, self.agent.single_popup)
+                yield 'q'
+                return
 
             yield from 'o'
             if ' is empty' in self.agent.single_message and not self.agent.single_popup:
@@ -338,20 +370,23 @@ class Inventory:
                 category = None
                 while self.agent._observation['misc'][2]:
                     yield ' '
-                assert self.agent.popup.count('Take out what?') == 1, self.agent.popup
+                if not self.agent.popup or self.agent.popup.count('Take out what?') != 1:
+                    yield 'q'
+                    return
                 for text in self.agent.popup[self.agent.popup.index('Take out what?') + 1:]:
                     if not text:
                         continue
                     if text in self._name_to_category:
                         category = self._name_to_category[text]
                         continue
-                    assert category is not None
-                    assert text[1:4] == ' - '
+                    if category is None or len(text) < 4 or text[1:4] != ' - ':
+                        continue
                     text = text[4:]
                     content.items.append(self.item_manager.get_item_from_text(text, category=category, position=None))
                 return
 
-            assert 0, (self.agent.single_message, self.agent.single_popup)
+            yield from 'q'
+            return
 
         with self.agent.atom_operation():
             # TODO: refactor: the same fragment is in use_container
@@ -367,10 +402,16 @@ class Inventory:
                 while True:
                     if "You don't find anything here to loot." in self.agent.message:
                         raise AgentPanic('no container below me')
-                    assert 'Loot which containers?' not in self.agent.popup, self.agent.popup
-                    assert 'There is ' in self.agent.message and ', loot it?' in self.agent.message, self.agent.message
+                    if 'Loot which containers?' in self.agent.popup:
+                        self.agent.step(A.Command.ESC)
+                        return
+                    if 'There is ' not in self.agent.message or ', loot it?' not in self.agent.message:
+                        self.agent.step(A.Command.ESC)
+                        return
                     r = re.findall(r'There is ([a-zA-z0-9# ]+) here\, loot it\? \[ynq\] \(q\)', self.agent.message)
-                    assert len(r) == 1, self.agent.message
+                    if len(r) != 1:
+                        self.agent.step(A.Command.ESC)
+                        return
                     text = r[0]
                     it = self.item_manager.get_item_from_text(text,
                                                               position=(
@@ -473,6 +514,7 @@ class Inventory:
                 else:
                     self.agent.step(A.Command.PICKUP)  # FIXME: parse LOOK output, add this fragment to pickup method
                     if 'Pick up what?' not in self.agent.popup:
+                        popup_str = '\n'.join(self.agent.popup)
                         if 'You cannot reach the bottom of the pit.' in self.agent.message or \
                                 'You cannot reach the bottom of the abyss.' in self.agent.message or \
                                 'You cannot reach the floor.' in self.agent.message or \
@@ -481,11 +523,18 @@ class Inventory:
                                 'You read:' in self.agent.message or \
                                 "You don't see anything in here to pick up." in self.agent.message or \
                                 'You cannot reach the ground.' in self.agent.message or \
-                                "You don't feel anything in here to pick up." in self.agent.message:
+                                "You don't feel anything in here to pick up." in self.agent.message or \
+                                'is empty.  Do what with it?' in popup_str or \
+                                'is empty.  Do what with it?' in self.agent.message:
+                            if 'is empty.  Do what with it?' in popup_str or \
+                                    'is empty.  Do what with it?' in self.agent.message:
+                                self.agent.step('q')
                             items = []
                             letters = []
                         else:
-                            assert 0, (self.agent.message, self.agent.popup)
+                            self.agent.step(A.Command.ESC)
+                            items = []
+                            letters = []
                     else:
                         lines = self.agent.popup[self.agent.popup.index('Pick up what?') + 1:]
                         category = None
@@ -961,7 +1010,7 @@ class Inventory:
             f"This {wand_regex} is a wand of digging!": ['digging'],
             "Gravel flies up from the floor!": ['digging'],
             f"This {wand_regex} is a wand of fire!": ['fire'],
-            "Lightning arcs from the wand. You are blinded by the flash!": ['lighting'],
+            "Lightning arcs from the wand. You are blinded by the flash!": ['lightning'],
             f"This {wand_regex} is a wand of lightning!": ['lightning'],
             f"The {floor_regex} is riddled by bullet holes!": ['magic missile'],
             f'The engraving now reads:': ['polymorph'],
@@ -1289,6 +1338,8 @@ class Inventory:
 
         items = {}
         for y, x in sorted(zip(*mask.nonzero()), key=lambda p: dis[p]):
+            if (y, x) == (self.agent.blstats.y, self.agent.blstats.x):
+                continue
             for i in level.items[y, x]:
                 assert i not in items
                 items[i] = (y, x)

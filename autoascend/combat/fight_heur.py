@@ -4,11 +4,11 @@ from itertools import product
 import numpy as np
 from scipy import signal
 
-from ..glyph import G
+from ..glyph import G, MON
+from .. import jf_config, utils
 from ..utils import adjacent
 from .monster_utils import is_monster_faster, is_dangerous_monster, \
-    ONLY_RANGED_SLOW_MONSTERS, EXPLODING_MONSTERS, WEAK_MONSTERS, consider_melee_only_ranged_if_hp_full, \
-    imminent_death_on_melee
+    ONLY_RANGED_SLOW_MONSTERS, EXPLODING_MONSTERS, WEAK_MONSTERS, consider_melee_only_ranged_if_hp_full
 from .movement_priority import draw_monster_priority_positive, draw_monster_priority_negative
 from .utils import wielding_ranged_weapon, line_dis_from, inside
 
@@ -26,8 +26,8 @@ def melee_monster_priority(agent, monsters, monster):
         ret += 1
     # Bare-handed or ungloved melee against cockatrice causes instant petrification:
     if 'cockatrice' in mon.mname or 'chickatrice' in mon.mname:
-        gloves = agent.inventory.gloves
-        wielded = agent.inventory.main_hand
+        gloves = getattr(agent.inventory.items, 'gloves', None)
+        wielded = getattr(agent.inventory.items, 'main_hand', None)
         if wielded is None or gloves is None:
             ret -= 500
     if mon.mname in ONLY_RANGED_SLOW_MONSTERS:
@@ -37,12 +37,6 @@ def melee_monster_priority(agent, monsters, monster):
                 ret -= 10
             if mon.mname == 'gas spore':
                 ret -= 5
-
-    # hypothesis: honor the low-HP melee danger check by preferring an escape
-    # move over an adjacent attack when the movement heuristic says to retreat.
-    if imminent_death_on_melee(agent, monster) and mon.mname not in WEAK_MONSTERS \
-            and mon.mname not in ONLY_RANGED_SLOW_MONSTERS:
-        ret -= 20
 
     if mon.mname == 'gas spore':
         # handle a specific case when you are trapped by a gas spore
@@ -181,7 +175,7 @@ def get_potential_wand_usages(agent, monsters, dy, dx):
     # TODO: also get items recursively from bags
     for item in agent.inventory.items:
         targeted_monsters = set()
-        if not item.is_offensive_usable_wand():
+        if not item.is_offensive_usable_wand() or agent.inventory.is_known_empty(item):
             continue
         priority = 0
         # print('--------------', dy, dx)
@@ -257,7 +251,17 @@ def get_available_actions(agent, monsters):
                 priority -= 100
             dy = y - agent.blstats.y
             dx = x - agent.blstats.x
-            actions.append((priority, ('melee', dy, dx)))
+            # hypothesis: refusing all bare contact with cockatrices prevents
+            # instant petrification, while leaving ranged attacks and retreat
+            # available to both armed and unarmed characters.
+            bare_handed = getattr(agent.inventory.items, 'main_hand', None) is None
+            bare_hands = getattr(agent.inventory.items, 'gloves', None) is None
+            bare_feet = getattr(agent.inventory.items, 'boots', None) is None
+            if ord(mon.mlet) == MON.S_COCKATRICE and bare_handed and bare_hands:
+                if not bare_feet:
+                    actions.append((priority, ('kick', dy, dx)))
+            else:
+                actions.append((priority, ('melee', dy, dx)))
 
     # ranged attack actions
     for dy, dx in product([-1, 0, 1], [-1, 0, 1]):
@@ -312,7 +316,7 @@ def goto_action(agent, priority, monsters):
         if not adjacent((agent.blstats.y, agent.blstats.x), (my, mx)):
             # and not mon.mname in ONLY_RANGED_SLOW_MONSTERS:
             return [(1, ('go_to', my, mx))]
-    assert 0, monsters
+    return []
 
 
 def get_corridors_priority_map(walkable):
@@ -347,7 +351,7 @@ def get_priorities(agent):
     priority -= priority[agent.blstats.y, agent.blstats.x]
 
     actions = get_available_actions(agent, monsters)
-    if not any(a[1][0] in ('melee', 'ranged') for a in actions):
+    if not any(a[1][0] in ('melee', 'kick', 'ranged') for a in actions):
         actions.extend(goto_action(agent, priority, monsters))
     return priority, actions
 

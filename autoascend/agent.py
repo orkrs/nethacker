@@ -9,12 +9,13 @@ import numpy as np
 from nle.nethack import actions as A
 
 from . import combat
+from . import jf_config, jf_log
 from . import utils
 from .character import Character
 from .exceptions import AgentPanic, AgentFinished, AgentChangeStrategy
 from .exploration_logic import ExplorationLogic
 from .global_logic import GlobalLogic
-from .glyph import MON, C, Hunger, G, SHOP
+from .glyph import MON, C, Hunger, G, SHOP, SS
 from .item import Item, flatten_items
 from .item.inventory import Inventory
 from .level import Level
@@ -58,9 +59,23 @@ class Agent:
         self.last_bfs_dis = None
         self.last_bfs_step = None
         self.last_prayer_turn = None
+        self.prayer_hold_until = -1
+        self.prayer_failed = False
+        self._monk_meat_meals = 0
         self._previous_glyphs = None
         self._last_turn = -1
         self._inactivity_counter = 0
+        self._pass_turn_after_error = False
+        self._update_failures = {}
+        self._text_prompt_escapes = 0
+        self._teleport_prompt_escapes = 0
+        self._suppressed_updates = {}
+        self._last_panic_signature = None
+        self._panic_repeats = 0
+        self._random_walk_steps = 0
+        self.resumed_game = False  # set by the driver when a fresh agent takes over a running game
+        self._petrifying_bodies = frozenset(MON.body_from_name(n) for n in ('cockatrice', 'chickatrice'))
+        self._wet_glyphs = frozenset({SS.S_pool, SS.S_water, SS.S_lava})
         self._is_updating_state = False
 
         self._no_step_calls = False
@@ -79,6 +94,13 @@ class Agent:
         self.last_cast_fail_turn = defaultdict(lambda: -float('inf'))
 
         self.stats_logger = StatsLogger()
+
+    def log(self, msg):
+        if jf_log.enabled():
+            bl = getattr(self, 'blstats', None)
+            where = f't{bl.time} d{bl.depth} {bl.dungeon_number}:{bl.level_number} xl{bl.experience_level} ' \
+                    f'hp{bl.hitpoints}/{bl.max_hitpoints}' if bl is not None else 't?'
+            jf_log.log(f'[s{self.step_count} {where}] {msg}')
 
     @property
     def has_pet(self):
@@ -368,7 +390,7 @@ class Agent:
         self.step_count += 1
         self.score += reward
 
-        self.cursor_pos = (observation['tty_cursor'][0] - 1, observation['tty_cursor'][1])
+        self.cursor_pos = (max(0, int(observation['tty_cursor'][0]) - 1), max(0, int(observation['tty_cursor'][1])))
 
         if hasattr(self, 'blstats'):
             for item in flatten_items(self.inventory.items):
@@ -404,22 +426,34 @@ class Agent:
             self.step(A.TextCharacters.SPACE)
             return
 
-        if observation['misc'][1]:  # entering text
+        if observation['misc'][1] and self._text_prompt_escapes < 5:  # entering text
             if "You may wish for an object." in self.message:
                 # TODO: wishing strategy
                 # TODO: assume wished item as blessed
                 self.step('b', iter('lessed greased +2 gray dragon scale mail\r'))
                 return
             else:
+                # a text-entry flag that survives ESC after ESC recursed update->step->update until
+                # RecursionError (a b4 dive); after 5 escapes treat the flag as stale
+                self._text_prompt_escapes += 1
                 self.step(A.Command.ESC)
                 return
+        if not observation['misc'][1]:
+            self._text_prompt_escapes = 0
 
-        if 'Where do you want to be teleported?' in self.message:
-            # TODO: teleport control
+        if 'Where do you want to be teleported?' in self.single_message and self._teleport_prompt_escapes < 3:
+            # TODO: teleport control. Checking the accumulated self.message (it keeps the prompt text
+            # after ESC answered it) recursed update->step->update into a RecursionError mid-dive.
+            self._teleport_prompt_escapes += 1
             self.step(A.Command.ESC)
             return
+        self._teleport_prompt_escapes = 0
 
         if b'[yn]' in bytes(observation['tty_chars'].reshape(-1)):
+            # a foocubus: don't let it put a (maybe cursed: levitation strands a dive) ring on us
+            if 'Would you wear it for me?' in self.single_message:
+                self.type_text('n')
+                return
             self.type_text('y')
             return
 
@@ -471,12 +505,31 @@ class Agent:
         try:
             if allow_update:
                 # functions that are allowed to call state unchanging steps
-                for func in [self.character.update, self.inventory.update, self.monster_tracker.update,
-                             partial(self.check_terrain, force=False), self.update_level,
-                             self.global_logic.update]:
-                    func()
-                    self.message = message
-                    self.popup = popup
+                for name, func in [('character', self.character.update), ('inventory', self.inventory.update),
+                                   ('monsters', self.monster_tracker.update),
+                                   ('terrain', partial(self.check_terrain, force=False)),
+                                   ('level', self.update_level), ('global', self.global_logic.update)]:
+                    if self._suppressed_updates.get(name, -1) >= self.step_count:
+                        if name == 'inventory':
+                            self.inventory.set_unknown_below_me()
+                        continue
+                    try:
+                        func()
+                        self._update_failures[name] = 0
+                    except (AgentFinished, KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as e:
+                        # an updater that fails on every step (e.g. an unparseable item under us)
+                        # would freeze the agent forever: after 3 failures in a row, skip it a while
+                        self._update_failures[name] = self._update_failures.get(name, 0) + 1
+                        if self._update_failures[name] >= 3:
+                            self._update_failures[name] = 0
+                            self._suppressed_updates[name] = self.step_count + 50
+                            self.log(f'suppressing updater {name} for 50 steps: {type(e).__name__} {str(e)[:150]}')
+                        raise
+                    finally:
+                        self.message = message
+                        self.popup = popup
 
             if allow_callbacks:
                 self.call_update_functions()
@@ -591,6 +644,13 @@ class Agent:
         if utils.isin(self.glyphs, G.SWALLOW).any():
             return
 
+        # hypothesis: stepping onto a cockatrice-family corpse to fetch thrown daggers (or feeling it
+        # while blind) petrified an XL9 elite game; astra: never touch the corpse. Without gloves,
+        # squares showing such a corpse are off-limits for pathing and item gathering.
+        bodies = utils.isin(self.glyphs, self._petrifying_bodies)
+        if bodies.any():
+            self.current_level().petrify_until[bodies] = self.blstats.time + 300  # corpses rot in ~250
+
         if utils.any_in(self.glyphs, G.PETS):
             self._last_pet_seen = self.blstats.time
 
@@ -610,6 +670,16 @@ class Agent:
         level.seen[mask] = True
         level.objects[mask] = self.glyphs[mask]
         level.walkable[mask] = False
+
+        # water and lava are never walkable once seen (a dive on Medusa's level kept walking into the
+        # water: a monster or item glyph first shown there had made the square 'walkable')
+        dive = getattr(self.global_logic, 'dive', None)
+        if dive is not None and dive.diving:
+            mask = utils.isin(self.glyphs, self._wet_glyphs)
+            if mask.any():
+                level.seen[mask] = True
+                level.objects[mask] = self.glyphs[mask]
+                level.walkable[mask] = False
 
         self._update_level_items()
         self._update_level_shops()
@@ -731,14 +801,56 @@ class Agent:
             return self.message
 
     def is_safe_to_pray(self, limit=500):
+        # the dive's dwarf hunt: a peaceful kill may cost Luck -1, and prayers fail while Luck < 0
+        if self.blstats.time < self.prayer_hold_until:
+            return False
         return (
-                (self.last_prayer_turn is None and self.blstats.time > 50) or
+                (self.last_prayer_turn is None and self.blstats.time > 300) or
                 (self.last_prayer_turn is not None and self.blstats.time - self.last_prayer_turn > limit)
         )
 
+    # angrygods() messages -- after one of them the god stays angry, so waiting for a safe prayer is pointless
+    PRAYER_FAILURE_MESSAGES = ('is displeased', 'is bummed', 'Thou hast angered me', 'Thou must relearn thy lessons',
+                               'Thou art arrogant', 'Thou hast strayed', 'Thou durst')
+
+    # prayer timeout is rnz(350) after a successful prayer and hunger is fixed only if it is below 200,
+    # so a hunger prayer fails in ~7% of cases after 900 turns but only in ~2% after 1200 turns
+    SAFE_HUNGER_PRAYER_GAP = 1200
+
+    def _critically_low_hp(self):
+        """pray.c critically_low_hp(): the only HP level at which prayer fixes anything. DT6A's
+        'HP < 12' made an XL1 Valkyrie (18 max HP) pray at 11 HP -- no trouble, so once the timeout
+        wasn't zero: 'Tyr is displeased', Luck -3, and every later prayer failed."""
+        bl = self.blstats
+        xl = bl.experience_level
+        maxhp = min(bl.max_hitpoints, 15 * xl)
+        divisor = 5 if xl <= 5 else 6 if xl <= 13 else 7 if xl <= 21 else 8 if xl <= 29 else 9
+        return bl.hitpoints <= 5 or bl.hitpoints * divisor <= maxhp
+
+    def _hunger_prayer_gap(self):
+        # A prayer resets nutrition to 900 and Weak comes ~850 turns later, so DT6A's 1200-turn gap
+        # left every Dlvl-1 grind Fainting for hundreds of turns and praying at Fainting on a 400-turn
+        # gap (failures, level drain, starvation). With EARLY_FIXES pray at Weak from a 900-turn gap
+        # (rnz(350) failure risk ~6%) instead of fainting first.
+        return 900 if jf_config.EARLY_FIXES else self.SAFE_HUNGER_PRAYER_GAP
+
+    def _eat_before_praying(self):
+        # hypothesis: at XL < 5 the emergency prayer is the only answer to a bad fight (an XL2 elite
+        # game spent it on hunger at T1350 and died to a goblin at T1660 with nothing left); eat the
+        # food we carry instead of praying for hunger while that weak.
+        if self.blstats.experience_level >= 5 or not jf_config.EARLY_FIXES:
+            return False
+        return any(item.category == nh.FOOD_CLASS and item.objs[0].name != 'sprig of wolfsbane' and
+                   not item.is_corpse() for item in flatten_items(self.inventory.items))
+
     def pray(self):
+        self.log(f'PRAY hp={self.blstats.hitpoints}/{self.blstats.max_hitpoints} hunger={self.blstats.hunger_state}')
+        history_len = len(self._message_history)
         self.step(A.Command.PRAY)
         self.last_prayer_turn = self.blstats.time
+        messages = ' '.join(self._message_history[history_len:] + [self.message])
+        if any(msg in messages for msg in self.PRAYER_FAILURE_MESSAGES):
+            self.prayer_failed = True
         # TODO: return value
         return True
 
@@ -757,10 +869,16 @@ class Agent:
         return True
 
     def zap(self, item, direction):
+        # astra: an empty wand prints "Nothing happens" without asking for a direction, and a blindly
+        # queued direction key then becomes a move or a melee attack. Only answer the prompt if it's
+        # there, and remember wands that turned out empty.
         with self.atom_operation():
             self.step(A.Command.ZAP)
             self.type_text(self.inventory.items.get_letter(item))
-            self.direction(direction)
+            if not jf_config.LATE_FIXES or 'In what direction?' in self.message:
+                self.direction(direction)
+            elif 'Nothing happens' in self.message or 'You wrest' in self.message:
+                self.inventory.empty_wands.add(item.text)
         return True
 
     def fire(self, item, direction):
@@ -868,9 +986,16 @@ class Agent:
                     (self.blstats.y, self.blstats.x)] = (level.key(), (expected_y, expected_x))
 
         else:
+            from_y, from_x = self.blstats.y, self.blstats.x
             self.direction(dir)
 
             if self.blstats.y != expected_y or self.blstats.x != expected_x:
+                # the map thought this was a doorless doorway, but the door is intact: remember it as a
+                # door so BFS stops planning diagonal steps through it (a b5 dive looped on this)
+                if 'diagonally out of an intact doorway' in self.message:
+                    self.current_level().intact_doors[from_y, from_x] = True
+                elif 'diagonally into an intact doorway' in self.message:
+                    self.current_level().intact_doors[expected_y, expected_x] = True
                 raise AgentPanic(f'agent position do not match after "move": '
                                  f'expected ({expected_y}, {expected_x}), got ({self.blstats.y}, {self.blstats.x})')
 
@@ -945,6 +1070,8 @@ class Agent:
         walkable = level.walkable & ~utils.isin(self.glyphs, G.BOULDER) & \
                    ~self.monster_tracker.peaceful_monster_mask & \
                    ~level.forbidden
+        if jf_config.HAZARD_FIXES and self.inventory.items.gloves is None:
+            walkable &= ~(level.petrify_until > self.blstats.time)
 
         if self._last_turn - self._allow_walking_through_traps_turn > 50:
             walkable &= ~utils.isin(level.objects, G.TRAPS)
@@ -956,7 +1083,8 @@ class Agent:
 
         dis = utils.bfs(y, x,
                         walkable=walkable,
-                        walkable_diagonally=walkable & ~utils.isin(level.objects, G.DOORS) & (level.objects != -1),
+                        walkable_diagonally=walkable & ~utils.isin(level.objects, G.DOORS) & (level.objects != -1)
+                                            & ~level.intact_doors,
                         can_squeeze=self.inventory.items.total_weight <= 600 and \
                                     self.current_level().dungeon_number != Level.SOKOBAN,
                         )
@@ -1136,12 +1264,15 @@ class Agent:
                 actions = list(filter(lambda x: x[1][0] != 'ranged', actions))
 
             if allow_attack_all:
-                attack_actions = [a for a in actions if a[1][0] in ('melee', 'ranged', 'zap')]
+                attack_actions = [a for a in actions if a[1][0] in ('melee', 'kick', 'ranged', 'zap')]
                 if attack_actions:
                     actions = attack_actions
 
             if not actions:
-                assert 0, 'No possible action available during fight2'
+                # nothing possible (cornered, inventory unknown): let a turn pass instead of a panic loop
+                # that freezes the game clock until the no-progress timeout (an s6 dive, T38441)
+                self.search()
+                continue
 
             priority, best_action = max(actions, key=lambda x: x[0]) if actions else None
 
@@ -1170,6 +1301,12 @@ class Agent:
                 self.melee_attack(target_y, target_x)
                 wait_counter = 0
                 return wait_counter
+
+        elif best_action[0] == 'kick':
+            _, dy, dx = best_action
+            self.kick(self.blstats.y + dy, self.blstats.x + dx)
+            wait_counter = 0
+            return wait_counter
 
         elif best_action[0] == 'ranged':
             _, dy, dx = best_action
@@ -1202,7 +1339,7 @@ class Agent:
             else:
                 _, dy, dx, = best_action
                 for item in self.inventory.items:
-                    if item.is_offensive_usable_wand():
+                    if item.is_offensive_usable_wand() and not self.inventory.is_known_empty(item):
                         wand = item
                         break
                 else:
@@ -1245,17 +1382,17 @@ class Agent:
     def _is_corpse_editable(self, monster_id, age_turn):
         permonst = MON.permonst(monster_id)
 
-        # hypothesis: skipping garter-snake corpses avoids unpredictable
-        # poisoning from stale or rapidly spoiling ground-corpse age data.
-        if permonst.mname == 'garter snake':
+        # hypothesis: starving (Weak or worse) with HP to spare, poison (-1d4 Str, -1d15 HP) or acid
+        # (-1d15 HP) beats fainting next to a monster -- two XL11 dives died that way in the Mines
+        starving = jf_config.STARVING_EATS and self.blstats.hunger_state >= Hunger.WEAK and \
+            self.blstats.hitpoints > 40 and (jf_config.LATE_FIXES or self.global_logic.dive.diving)
+
+        # TODO: read intrinsics
+        if self.character.race != Character.ORC and permonst.mflags1 & MON.M1_POIS != 0 and not starving:
             return False
 
         # TODO: read intrinsics
-        if self.character.race != Character.ORC and permonst.mflags1 & MON.M1_POIS != 0:
-            return False
-
-        # TODO: read intrinsics
-        if permonst.mflags1 & MON.M1_ACID != 0:
+        if permonst.mflags1 & MON.M1_ACID != 0 and not starving:
             return False
 
         if permonst.mflags2 & MON.M2_WERE != 0:
@@ -1419,13 +1556,33 @@ class Agent:
         #     self.cast('healing', direction=(0, 0))
         #     return
 
+        # hypothesis (astra guard.py stop list): stoning, sliming, strangling and food poisoning /
+        # terminal illness kill within a few turns; prayer fixes all of them, so a riskier-than-usual
+        # prayer beats certain death. Stoning: a carried lizard corpse cures it without prayer.
+        deadly = int(self.last_observation['blstats'][nh.NLE_BL_CONDITION]) & (
+            nh.BL_MASK_STONE | nh.BL_MASK_SLIME | nh.BL_MASK_STRNGL | nh.BL_MASK_FOODPOIS | nh.BL_MASK_TERMILL)
+        # Only fires when death is otherwise certain within a few turns, so it can never lower a
+        # max-progress score: on in every configuration (the elite's early game is untouched).
+        if deadly:
+            if deadly & nh.BL_MASK_STONE:
+                lizards = [item for item in flatten_items(self.inventory.items) if item.is_corpse() and
+                           item.monster_id == MON.from_name('lizard') - nh.GLYPH_MON_OFF]
+                if lizards:
+                    yield True
+                    self.log('EMERGENCY stoning: eating a lizard corpse')
+                    self.inventory.eat(lizards[0])
+                    return
+            if self.current_level().dungeon_number != 1 and self.is_safe_to_pray(100):
+                yield True
+                self.log(f'EMERGENCY deadly status {deadly:#x}: praying')
+                self.pray()
+                return
+
         items = [item for item in flatten_items(self.inventory.items) if item.is_unambiguous() and
                  item.category == nh.POTION_CLASS and item.object.name in ['healing', 'extra healing', 'full healing']]
         if (
-                # hypothesis: healing before half HP prevents early high-damage
-                # fights from reaching the bot's too-late emergency threshold.
-                (self.blstats.hitpoints < 9 / 20 * self.blstats.max_hitpoints
-                 or self.blstats.hitpoints < 10) and items
+                (self.blstats.hitpoints < 1 / 3 * self.blstats.max_hitpoints
+                 or self.blstats.hitpoints < 8) and items
         ):
             yield True
             self.inventory.quaff(items[0])
@@ -1438,23 +1595,65 @@ class Agent:
             self.inventory.quaff(items[0])
             return
 
-        # Emergency food ration consumption before passing out from starvation
-        if self.blstats.hunger_state >= Hunger.WEAK:
-            for item in flatten_items(self.inventory.items):
-                if item.category == nh.FOOD_CLASS and item.objs[0].name != 'sprig of wolfsbane' and not item.is_corpse():
-                    yield True
-                    self.inventory.eat(item)
-                    return
-
+        if jf_config.EARLY_FIXES:
+            low_hp = self._critically_low_hp()
+        else:
+            low_hp = (self.blstats.hitpoints < 1 / (5 if self.blstats.experience_level < 6 else 6)
+                      * self.blstats.max_hitpoints or
+                      self.blstats.hitpoints < (12 if self.character.role != Character.MONK or
+                                                self._monk_meat_meals == 0 else 8))
         if (
-                (self.is_safe_to_pray(500) and
-                 (self.blstats.hitpoints < 1 / (5 if self.blstats.experience_level < 6 else 6)
-                  * self.blstats.max_hitpoints or self.blstats.hitpoints <= 7))
+                (self.is_safe_to_pray(500) and low_hp)
                 or (self.is_safe_to_pray(400) and self.blstats.hunger_state >= Hunger.FAINTING)
+                or (not self.prayer_failed and self.blstats.hunger_state >= Hunger.WEAK and
+                    self.is_safe_to_pray(self._hunger_prayer_gap()) and not self._eat_before_praying())
         ):
             yield True
             self.pray()
             return
+
+        # Last resort (LAST_RESORT): about to die, no safe prayer, a hostile adjacent. The game is
+        # usually lost here, so gambles have positive value for a max-progress score: stairs (down
+        # also banks depth), unknown wands at the attacker, unknown potions, unknown scrolls.
+        if jf_config.LAST_RESORT and self._critically_low_hp():
+            y, x = self.blstats.y, self.blstats.x
+            adjacent = [m for m in self.get_visible_monsters() if utils.adjacent((m[1], m[2]), (y, x))]
+            if adjacent:
+                level = self.current_level()
+                here = level.objects[y, x]
+                if here in G.STAIR_DOWN and level.dungeon_number != Level.SOKOBAN:
+                    yield True
+                    self.log('LAST RESORT: down the stairs')
+                    self.move('>')
+                    return
+                if here in G.STAIR_UP and self.blstats.depth > 1 and level.dungeon_number != Level.SOKOBAN:
+                    yield True
+                    self.log('LAST RESORT: up the stairs')
+                    self.move('<')
+                    return
+                items = flatten_items(self.inventory.items)
+                _, my, mx, _, _ = adjacent[0]
+                for item in items:
+                    if item.category == nh.WAND_CLASS and not item.is_unambiguous() and \
+                            not self.inventory.is_known_empty(item) and item.comment != 'EMPT':
+                        yield True
+                        self.log(f'LAST RESORT: zapping unknown {item.text!r}')
+                        self.zap(item, self.calc_direction(y, x, my, mx))
+                        return
+                for item in items:
+                    if item.category == nh.POTION_CLASS and not item.is_unambiguous():
+                        yield True
+                        self.log(f'LAST RESORT: quaffing unknown {item.text!r}')
+                        self.inventory.quaff(item)
+                        return
+                for item in items:
+                    if item.category == nh.SCROLL_CLASS and not item.is_unambiguous():
+                        yield True
+                        self.log(f'LAST RESORT: reading unknown {item.text!r}')
+                        with self.atom_operation():
+                            self.step(A.Command.READ)
+                            self.type_text(self.inventory.items.get_letter(item))
+                        return
 
         # if self.inventory.engraving_below_me.lower() != 'elbereth' and self.can_engrave() and \
         #         (self.blstats.hitpoints < 1 / 5 * self.blstats.max_hitpoints or self.blstats.hitpoints < 5):
@@ -1472,6 +1671,18 @@ class Agent:
     @Strategy.wrap
     def eat_from_inventory(self):
         if self.blstats.hunger_state < Hunger.HUNGRY:
+            yield False
+        # hypothesis: prayer is the main food source, but a hunger prayer made on the bare ~900-1100 turn
+        # starvation cycle comes too soon in ~4-7% of cases -- the hunger is not fixed and the god gets angry,
+        # so the character usually starves or dies while fainting (a common cause of early deaths); keeping
+        # the stored food as a reserve that is eaten only when a prayer would be risky (and praying already
+        # when Weak if it is safe) should make those failures rarer and raise progression for every character
+        # the dive eats what it carries as soon as it is Hungry: its prayers are for HP emergencies
+        # (a dive fainted at Dlvl 6 and died fighting); the tour keeps DT6A's hoard-and-pray policy
+        diving = self.global_logic.dive.diving
+        if not diving and not self.prayer_failed and self.blstats.hunger_state < Hunger.FAINTING and \
+                (self.blstats.hunger_state == Hunger.HUNGRY or self.is_safe_to_pray(self.SAFE_HUNGER_PRAYER_GAP)) \
+                and not (self.blstats.hunger_state >= Hunger.WEAK and self._eat_before_praying()):
             yield False
         for item in flatten_items(self.inventory.items):
             if item.category == nh.FOOD_CLASS and \
@@ -1515,12 +1726,80 @@ class Agent:
         if isinstance(exc, (KeyboardInterrupt, AgentFinished, SystemExit)):
             raise exc
         if isinstance(exc, BaseException):
-            if not isinstance(exc, AgentPanic) and not self.panic_on_errors:
-                raise exc
+            # hypothesis: many games end early because the bot crashes, not because the
+            # character dies. The Sokoban map strings were indented, so every scripted push
+            # failed an assertion, and other errors (unhandled prompts, hallucination missed on
+            # the abbreviated status line, weightless items, stale-state assertions) were
+            # re-raised. Either way the AutoAscend thread died, the arena only got ESC fallbacks
+            # and NLE aborted ~29% of games with a healthy character. Fixing those crash sources
+            # and recovering from every error like an AgentPanic (letting a turn pass when the
+            # same error repeats) keeps the games alive to gain more experience levels and depth.
+            if not isinstance(exc, AgentPanic):
+                self._drop_state_after_error()
             self.stats_logger.log_event('agent_panic')
             self.all_panics.append(exc)
+            self.all_panics = self.all_panics[-50:]
+            if jf_log.enabled():
+                import traceback
+                deep = type(exc).__name__ == 'AgentHang'
+                tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__,
+                                                        limit=None if deep else -6))
+                self.log(f'PANIC {type(exc).__name__}: {str(exc)[:300]}\n{tb[-(12000 if deep else 1500):]}')
+            self._note_repeated_panic(exc)
             if self.verbose:
                 print(f'PANIC!!!! : {exc}')
+
+    def _note_repeated_panic(self, exc):
+        """The same panic over and over (a move that never lands, a target it can't reach) can
+        burn the rest of the game while turns trickle by. Break the loop: forbid the square the
+        failing move aims at, or walk randomly for a few steps."""
+        signature = f'{type(exc).__name__}:{str(exc)[:120]}'
+        if signature == self._last_panic_signature:
+            self._panic_repeats += 1
+        else:
+            self._last_panic_signature = signature
+            self._panic_repeats = 1
+        if self._panic_repeats < 25:
+            return
+        self._panic_repeats = 0
+        m = re.search(r'expected \((\d+), (\d+)\)', str(exc))
+        if m is not None:
+            y, x = int(m.group(1)), int(m.group(2))
+            try:
+                self.current_level().forbidden[y, x] = True
+            except Exception:
+                pass
+            self.log(f'panic loop: forbidding {(y, x)} ({signature})')
+        else:
+            self.log(f'panic loop: random walk ({signature})')
+        self._random_walk_steps = 8
+
+    def _random_walk(self):
+        y, x = self.blstats.y, self.blstats.x
+        level = self.current_level()
+        options = [(ny, nx) for ny, nx in self.neighbors(y, x)
+                   if level.walkable[ny, nx] and not self.monster_tracker.monster_mask[ny, nx]]
+        if options:
+            ny, nx = options[self.rng.randint(len(options))]
+            self.direction(self.calc_direction(y, x, ny, nx))
+        else:
+            self.step(A.Command.SEARCH)
+
+    def _drop_state_after_error(self):
+        # An unexpected error can leave caches half-updated (e.g. the items below the agent
+        # cleared but never re-read). The recovery ESC steps run update() before on_panic()
+        # gets a chance to reset them, so drop them here (without stepping) to have them rebuilt.
+        if self._inactivity_counter >= 199:
+            # the 'turn inactivity' guard fired: the strategies loop without the game advancing
+            self._pass_turn_after_error = True
+        self._inactivity_counter = 0
+        self._is_reading_message_or_popup = False
+        self.inventory.items_below_me = None
+        self.inventory.letters_below_me = None
+        self.inventory.engraving_below_me = None
+        self.inventory._previous_blstats = None
+        self.inventory.items.on_panic()
+        self.monster_tracker.on_panic()
 
     def main(self):
         try:
@@ -1530,9 +1809,18 @@ class Agent:
                     self.step(A.Command.ESC)
                     self.step(A.Command.ESC)
 
-                    self.current_level().stair_destination[self.blstats.y, self.blstats.x] = \
-                        ((Level.PLANE, 1), (None, None))  # TODO: check level num
-                    self.character.parse()
+                    if not self.resumed_game:
+                        self.current_level().stair_destination[self.blstats.y, self.blstats.x] = \
+                            ((Level.PLANE, 1), (None, None))  # TODO: check level num
+                    try:
+                        self.character.parse()
+                    except Exception:
+                        # a fresh agent taking over mid-game: the identity can't change, reuse it
+                        prev = getattr(self, 'previous_character', None)
+                        if prev is None:
+                            raise
+                        for field in ('role', 'race', 'alignment', 'gender', 'self_glyph'):
+                            setattr(self.character, field, getattr(prev, field))
                     self.character.parse_enhance_view()
                     # self.character.parse_spellcast_view()
                     self.step(A.Command.AUTOPICKUP)
@@ -1546,18 +1834,45 @@ class Agent:
 
             last_step = self.step_count
             inactivity_counter = 0
+            forced_turns = 0
+            turn_after_forced = None
             while 1:
                 inactivity_counter += 1
                 if self.step_count != last_step:
                     inactivity_counter = 0
 
-                if inactivity_counter >= 5:
+                if self._random_walk_steps > 0:
+                    self._random_walk_steps -= 1
+                    try:
+                        self.step(A.Command.ESC)
+                        self._random_walk()
+                    except BaseException as e:
+                        self.handle_exception(e)
+                    last_step = self.step_count
+                    continue
+
+                if inactivity_counter >= 5 or self._pass_turn_after_error:
                     try:
                         panics = sorted({p.args[0] for p in self.all_panics[-5:]})
                     except (TypeError, IndexError):
                         panics = 'UNKNOWN'
 
-                    raise RuntimeError(f'Cyclic Panic: {panics}')
+                    # The same error keeps recurring without the game advancing. Let a turn pass
+                    # (so e.g. a monster in the way or a temporary status can change) instead of
+                    # giving up at once, unless nothing else has advanced the game for too long.
+                    if turn_after_forced is None or self.blstats.time != turn_after_forced:
+                        forced_turns = 0
+                    if forced_turns >= 300:
+                        raise RuntimeError(f'Cyclic Panic: {panics}')
+                    forced_turns += 1
+                    inactivity_counter = 0
+                    self._pass_turn_after_error = False
+                    try:
+                        self.step(A.Command.SEARCH)
+                    except BaseException as e:
+                        self.handle_exception(e)
+                    turn_after_forced = self.blstats.time
+                    last_step = self.step_count
 
                 try:
                     try:

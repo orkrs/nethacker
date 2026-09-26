@@ -32,7 +32,10 @@ def find(glyph):
 
 @functools.lru_cache(nh.NUMMONS)
 def from_name(name):
-    return nh.GLYPH_MON_OFF + id_from_name(name)
+    mon_id = id_from_name(name)
+    if mon_id is None:
+        return None
+    return nh.GLYPH_MON_OFF + mon_id
 
 
 @functools.lru_cache(nh.NUMMONS)
@@ -40,11 +43,14 @@ def id_from_name(name):
     for i in range(nh.NUMMONS):
         if nh.permonst(i).mname == name:
             return i
-    assert 0, name
+    return None
 
 
 def body_from_name(name):
-    return id_from_name(name) + nh.GLYPH_BODY_OFF
+    mon_id = id_from_name(name)
+    if mon_id is None:
+        return None
+    return mon_id + nh.GLYPH_BODY_OFF
 
 
 fn = from_name
